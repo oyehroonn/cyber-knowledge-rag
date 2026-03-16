@@ -23,7 +23,29 @@ class BugcrowdScraper(BaseScraper):
     SOURCE_NAME = "bugcrowd"
     BASE_URL = "https://bugcrowd.com"
     DISCLOSURES_URL = "https://bugcrowd.com/disclosures"
+    BLOG_BASE_URL = "https://www.bugcrowd.com/blog"
     REQUEST_DELAY = 1.5
+    
+    # Topic IDs for blog filtering (t__category=<ID>). Security-relevant first.
+    BLOG_TOPIC_IDS = [
+        (21, "Bug Hunter Methodology"),
+        (63, "Vulnerabilities"),
+        (27, "Vulnerability Disclosure"),
+        (1223, "Hacker Resources"),
+        (13, "Researcher Resources"),
+        (330, "Report Recap"),
+        (1224, "Penetration Testing"),
+        (441, "Penetration Testing as a Service"),
+        (1225, "Red Teaming"),
+        (9, "Attack Surface Management"),
+        (29, "Bug Bounty Management"),
+        (30, "Success Stories"),
+        (587, "Hacker Spotlight"),
+        (31, "Researcher Spotlight"),
+        (24, "Guest Blogs"),
+        (19, "Cybersecurity News"),
+        (20, "Thought Leadership"),
+    ]
     
     SEVERITY_MAP = {
         "p1": "critical",
@@ -137,101 +159,166 @@ class BugcrowdScraper(BaseScraper):
         
         return details
     
+    def _build_blog_listing_url(self, topic_id: Optional[int] = None, page: int = 1) -> str:
+        """Build URL for blog listing, optionally filtered by topic and page."""
+        if topic_id is not None:
+            url = f"{self.BLOG_BASE_URL}/?f__s=&t__category={topic_id}&a__author="
+        else:
+            url = f"{self.BLOG_BASE_URL}/"
+        if page > 1:
+            url += "&" if "?" in url else "?"
+            url += f"page={page}"
+        return url
+    
+    def _fetch_blog_listing_page(self, url: str) -> Optional[BeautifulSoup]:
+        """Fetch a blog listing page and return parsed soup."""
+        response = self._fetch_with_retry(url)
+        if not response or response.status_code != 200:
+            return None
+        return BeautifulSoup(response.text, "html.parser")
+    
+    def _parse_blog_listing(self, soup: BeautifulSoup) -> list[tuple[str, str]]:
+        """Extract blog post URLs and titles from a listing page. Returns list of (url, title)."""
+        results = []
+        seen = set()
+        # Links that point to blog posts: /blog/some-slug/ or full URL with /blog/slug
+        for a in soup.find_all("a", href=True):
+            try:
+                href = a.get("href", "").strip()
+                if not href or href.startswith("#"):
+                    continue
+                # Normalize to absolute URL
+                if href.startswith("/"):
+                    full_url = f"https://www.bugcrowd.com{href}"
+                elif "bugcrowd.com/blog/" in href:
+                    full_url = href.split("?")[0].rstrip("/") or href
+                else:
+                    continue
+                # Must look like a post: /blog/something (not just /blog or /blog/)
+                if "/blog" not in full_url:
+                    continue
+                path = full_url.replace("https://www.bugcrowd.com", "").replace("http://www.bugcrowd.com", "")
+                if path in ("/blog", "/blog/"):
+                    continue
+                # Has a slug after /blog/ (e.g. /blog/my-post-title/)
+                parts = path.strip("/").split("/")
+                if len(parts) < 2 or parts[0] != "blog":
+                    continue
+                slug = parts[1]
+                if not slug or len(slug) < 2:
+                    continue
+                if full_url in seen:
+                    continue
+                seen.add(full_url)
+                title = a.get_text(strip=True) or slug.replace("-", " ").title()
+                if len(title) > 200:
+                    title = title[:200]
+                results.append((full_url, title))
+            except Exception:
+                continue
+        return results
+    
+    def _scrape_single_blog_post(self, post_url: str, fallback_title: str = "Bugcrowd Blog Post") -> Optional[RawReport]:
+        """Fetch a single blog post and return a RawReport, or None on failure."""
+        try:
+            response = self._fetch_with_retry(post_url)
+            if not response or response.status_code != 200:
+                return None
+            soup = BeautifulSoup(response.text, "html.parser")
+            title = fallback_title
+            for tag in soup.find_all(["h1"]):
+                t = tag.get_text(strip=True)
+                if t and len(t) > 2:
+                    title = t[:300]
+                    break
+            body = None
+            for selector in ["article", "main", "[class*='post-body']", "[class*='article-body']", "[class*='content']"]:
+                node = soup.select_one(selector)
+                if node:
+                    text = node.get_text(separator="\n", strip=True)
+                    if text and len(text) >= 100:
+                        body = text[:15000]
+                        break
+            if not body or len(body) < 100:
+                return None
+            report_id = self._generate_id(post_url)
+            if self._report_exists(report_id):
+                return None
+            vuln_type = self._detect_vuln_type(title + " " + body)
+            report = RawReport(
+                id=report_id,
+                source=self.SOURCE_NAME,
+                title=title,
+                url=post_url,
+                body=body,
+                vuln_type=vuln_type,
+                severity="medium",
+            )
+            return report
+        except Exception as e:
+            console.print(f"[dim]Error scraping post {post_url[:50]}...: {e}[/dim]")
+            return None
+    
     def _scrape_blog_writeups(self, max_reports: int = 20) -> list[RawReport]:
-        """Scrape vulnerability write-ups from Bugcrowd resources."""
+        """Scrape blog posts from Bugcrowd blog with topic filtering."""
         reports = []
+        seen_urls = set()
+        max_pages_per_topic = 3  # Try up to 3 pages per topic
         
-        # Try multiple blog URLs (they change structure often)
-        blog_urls = [
-            "https://www.bugcrowd.com/blog/",
-            "https://www.bugcrowd.com/resources/",
-            "https://www.bugcrowd.com/resources/levelup/",
-            "https://www.bugcrowd.com/hackers/bugcrowd-university/",
-        ]
-        
-        for blog_url in blog_urls:
+        # First try unfiltered blog listing to get recent posts
+        for page in range(1, max_pages_per_topic + 1):
             if len(reports) >= max_reports:
                 break
-                
-            try:
-                response = self._fetch_with_retry(blog_url)
-                if not response or response.status_code != 200:
+            url = self._build_blog_listing_url(topic_id=None, page=page)
+            soup = self._fetch_blog_listing_page(url)
+            if not soup:
+                break
+            links = self._parse_blog_listing(soup)
+            if not links:
+                break
+            for post_url, title in links:
+                if len(reports) >= max_reports:
+                    break
+                if post_url in seen_urls:
                     continue
-                
-                soup = BeautifulSoup(response.text, "html.parser")
-                
-                # Find all article links
-                articles = soup.find_all("article")
-                if not articles:
-                    articles = soup.find_all("div", class_=re.compile(r"post|article|card", re.I))
-                if not articles:
-                    articles = soup.find_all("a", href=re.compile(r"/blog/|/resources/"))
-                
-                for article in articles[:max_reports]:
+                report_id = self._generate_id(post_url)
+                if self._report_exists(report_id):
+                    seen_urls.add(post_url)
+                    continue
+                seen_urls.add(post_url)
+                report = self._scrape_single_blog_post(post_url, fallback_title=title)
+                if report:
+                    self._save_report(report)
+                    reports.append(report)
+        
+        # Then scrape by topic (security-relevant topics)
+        for topic_id, topic_name in self.BLOG_TOPIC_IDS:
+            if len(reports) >= max_reports:
+                break
+            for page in range(1, max_pages_per_topic + 1):
+                if len(reports) >= max_reports:
+                    break
+                url = self._build_blog_listing_url(topic_id=topic_id, page=page)
+                soup = self._fetch_blog_listing_page(url)
+                if not soup:
+                    break
+                links = self._parse_blog_listing(soup)
+                if not links:
+                    break
+                for post_url, title in links:
                     if len(reports) >= max_reports:
                         break
-                    
-                    try:
-                        link = article.find("a", href=True) if article.name != "a" else article
-                        if not link:
-                            continue
-                        
-                        url = link.get("href", "")
-                        if not url:
-                            continue
-                        
-                        # Make absolute URL
-                        if url.startswith("/"):
-                            url = f"{self.BASE_URL}{url}"
-                        elif not url.startswith("http"):
-                            continue
-                        
-                        # Skip non-blog URLs
-                        if "/blog/" not in url and "/resources/" not in url:
-                            continue
-                        
-                        report_id = self._generate_id(url)
-                        if self._report_exists(report_id):
-                            continue
-                        
-                        # Get title
-                        title_elem = article.find("h2") or article.find("h3") or article.find("h4") or link
-                        title = title_elem.get_text(strip=True) if title_elem else "Unknown"
-                        
-                        # Fetch article body
-                        article_response = self._fetch_with_retry(url)
-                        body = None
-                        if article_response and article_response.status_code == 200:
-                            article_soup = BeautifulSoup(article_response.text, "html.parser")
-                            content = article_soup.find("article") or article_soup.find("main") or article_soup.find("div", class_=re.compile(r"content|post-body", re.I))
-                            if content:
-                                body = content.get_text(separator="\n", strip=True)
-                        
-                        if not body or len(body) < 100:
-                            continue
-                        
-                        # Detect vulnerability type from title/body
-                        vuln_type = self._detect_vuln_type(title + " " + body)
-                        
-                        report = RawReport(
-                            id=report_id,
-                            source=self.SOURCE_NAME,
-                            title=title,
-                            url=url,
-                            body=body,
-                            vuln_type=vuln_type,
-                            severity="medium",
-                        )
-                        
+                    if post_url in seen_urls:
+                        continue
+                    report_id = self._generate_id(post_url)
+                    if self._report_exists(report_id):
+                        seen_urls.add(post_url)
+                        continue
+                    seen_urls.add(post_url)
+                    report = self._scrape_single_blog_post(post_url, fallback_title=title)
+                    if report:
                         self._save_report(report)
                         reports.append(report)
-                        
-                    except Exception as e:
-                        continue
-                        
-            except Exception as e:
-                console.print(f"[dim]Error scraping {blog_url}: {e}[/dim]")
-                continue
         
         return reports
     

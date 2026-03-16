@@ -151,27 +151,35 @@ class PortSwiggerScraper(BaseScraper):
         return labs
     
     def _fetch_materials(self) -> list[dict]:
-        """Fetch learning materials (theory pages)."""
+        """Fetch learning materials (theory pages) from all-materials page."""
         response = self._fetch_with_retry(self.ALL_MATERIALS_URL)
         if not response or response.status_code != 200:
             return []
         
         soup = BeautifulSoup(response.text, "html.parser")
         materials = []
+        seen_hrefs = set()
         
-        # Find all material links
+        # Find all material links (topic pages, sub-pages)
         links = soup.find_all("a", href=re.compile(r"/web-security/"))
         
         for link in links:
             try:
                 href = link.get("href", "")
+                # Normalize: strip fragment and query
+                path = href.split("?")[0].split("#")[0].strip("/") or href
+                if path in seen_hrefs:
+                    continue
                 title = link.get_text(strip=True)
                 
-                # Skip lab links (already handled)
-                if "/lab-" in href or not title:
+                # Skip lab links (already handled), dashboard, empty titles
+                if "/lab-" in href or "dashboard" in href or not title or len(title) < 2:
                     continue
+                # Skip "all materials", "all labs" type links
+                if re.search(r"all-(labs|materials|topics)", href):
+                    continue
+                seen_hrefs.add(path)
                 
-                # Extract vulnerability class
                 vuln_class = None
                 for key, value in self.VULN_CLASS_MAP.items():
                     if key in href:
@@ -191,6 +199,40 @@ class PortSwiggerScraper(BaseScraper):
                 continue
         
         return materials
+    
+    def _scrape_all_materials(self, max_reports: int) -> list[RawReport]:
+        """Fetch all learning materials from all-materials and save as reports."""
+        reports = []
+        materials = self._fetch_materials()
+        console.print(f"[dim]Found {len(materials)} material pages[/dim]")
+        for mat in materials:
+            if len(reports) >= max_reports:
+                break
+            if self._report_exists(mat["id"]):
+                continue
+            content = self._fetch_page_content(mat["url"])
+            if not content or not content.get("body") or len(content.get("body", "")) < 100:
+                continue
+            report = RawReport(
+                id=mat["id"],
+                source=self.SOURCE_NAME,
+                title=mat["title"],
+                url=mat["url"],
+                vuln_type=mat.get("vuln_class"),
+                cwe=self.CWE_MAP.get(mat.get("vuln_class")) if mat.get("vuln_class") else None,
+                severity="high",
+                body=content.get("body"),
+                description=content.get("description"),
+                metadata={
+                    "type": "material",
+                    "solution": content.get("solution"),
+                    "attack_vector": content.get("attack_vector"),
+                    "remediation": content.get("remediation"),
+                },
+            )
+            self._save_report(report)
+            reports.append(report)
+        return reports
     
     def _fetch_page_content(self, url: str) -> Optional[dict]:
         """Fetch full content from a lab or material page."""
@@ -333,6 +375,16 @@ class PortSwiggerScraper(BaseScraper):
         if progress and task:
             progress.update(task, advance=len(category_reports))
         
+        if len(reports) >= max_reports:
+            console.print(f"[green]Scraped {len(reports)} new PortSwigger entries[/green]")
+            return reports[:max_reports]
+        
+        # All learning materials (theory pages from all-materials)
+        remaining = max_reports - len(reports)
+        material_reports = self._scrape_all_materials(remaining)
+        reports.extend(material_reports)
+        if progress and task:
+            progress.update(task, advance=len(material_reports))
         if len(reports) >= max_reports:
             console.print(f"[green]Scraped {len(reports)} new PortSwigger entries[/green]")
             return reports[:max_reports]

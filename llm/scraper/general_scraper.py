@@ -17,8 +17,16 @@ from llm.scraper.base_scraper import BaseScraper, RawReport
 
 console = Console()
 
+# Page with sidebar listing all OWASP cheat sheets (for discovery)
+OWASP_CHEATSHEETS_INDEX_URL = "https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Testing_Automation_Cheat_Sheet.html"
 
 DEFAULT_SOURCES = [
+    # OWASP Cheat Sheets: discover all from sidebar (ul.md-nav__list), then scrape each
+    {
+        "name": "owasp_cheatsheets",
+        "url": OWASP_CHEATSHEETS_INDEX_URL,
+        "type": "owasp_discover",
+    },
     # OWASP Top 10 2021
     {
         "name": "owasp_top10_2021",
@@ -417,6 +425,54 @@ class GeneralScraper(BaseScraper):
         
         return reports
     
+    def _discover_owasp_cheatsheet_urls(self, index_url: str) -> list[str]:
+        """Discover all OWASP cheat sheet URLs from sidebar nav (ul.md-nav__list)."""
+        urls = []
+        try:
+            response = self._fetch_with_retry(index_url)
+            if not response or response.status_code != 200:
+                return urls
+            soup = BeautifulSoup(response.text, "html.parser")
+            base = f"{urlparse(index_url).scheme}://{urlparse(index_url).netloc}"
+            nav = soup.find("ul", class_="md-nav__list")
+            if not nav:
+                nav = soup.find("nav", class_=re.compile(r"md-nav"))
+                if nav:
+                    nav = nav.find("ul", class_=re.compile(r"md-nav__list"))
+            if not nav:
+                # Fallback: any link to a Cheat_Sheet page
+                for a in soup.find_all("a", href=re.compile(r".*Cheat_Sheet.*\.html")):
+                    href = a.get("href", "")
+                    if href and "Cheat_Sheet" in href:
+                        full = urljoin(base + "/", href)
+                        if full not in urls:
+                            urls.append(full)
+                return urls
+            for a in nav.find_all("a", href=True):
+                href = a.get("href", "")
+                if "Cheat_Sheet" in href or "cheatsheet" in href.lower():
+                    full = urljoin(base + "/", href)
+                    if full not in urls:
+                        urls.append(full)
+        except Exception as e:
+            console.print(f"[dim]OWASP discover error: {e}[/dim]")
+        return urls
+    
+    def _scrape_owasp_discover(self, source: dict, max_reports: int) -> list[RawReport]:
+        """Discover OWASP cheat sheets from sidebar and scrape each."""
+        reports = []
+        urls = self._discover_owasp_cheatsheet_urls(source["url"])
+        console.print(f"[dim]Discovered {len(urls)} OWASP cheat sheets[/dim]")
+        for url in urls:
+            if len(reports) >= max_reports:
+                break
+            sub = {"name": f"owasp_{self._generate_id(url)[:8]}", "url": url, "type": "single_page"}
+            report = self._scrape_single_page(sub)
+            if report:
+                self._save_report(report)
+                reports.append(report)
+        return reports
+    
     def add_source(self, name: str, url: str, source_type: str = "single_page",
                    link_pattern: Optional[str] = None):
         """Add a new source to scrape."""
@@ -466,6 +522,13 @@ class GeneralScraper(BaseScraper):
                     source_reports = self._scrape_page_with_links(source, max_links=min(10, remaining))
                     reports.extend(source_reports)
                     
+                    if progress and task:
+                        progress.update(task, advance=len(source_reports))
+                
+                elif source["type"] == "owasp_discover":
+                    remaining = max_reports - len(reports)
+                    source_reports = self._scrape_owasp_discover(source, max_reports=remaining)
+                    reports.extend(source_reports)
                     if progress and task:
                         progress.update(task, advance=len(source_reports))
                 

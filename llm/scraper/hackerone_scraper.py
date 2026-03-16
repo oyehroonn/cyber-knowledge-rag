@@ -2,8 +2,10 @@
 HackerOne Report Scraper
 
 Scrapes publicly disclosed vulnerability reports from HackerOne's hacktivity feed.
+Supports optional login via HACKERONE_EMAIL and HACKERONE_PASSWORD in .env for more reports.
 """
 
+import os
 import re
 import json
 from typing import Optional
@@ -24,6 +26,8 @@ class HackerOneScraper(BaseScraper):
     
     SOURCE_NAME = "hackerone"
     HACKTIVITY_API = "https://hackerone.com/graphql"
+    SIGN_IN_URL = "https://hackerone.com/users/sign_in"
+    HACKTIVITY_OVERVIEW_URL = "https://hackerone.com/hacktivity/overview"
     REQUEST_DELAY = 1.5  # Slightly longer delay for HackerOne
     
     SEVERITY_MAP = {
@@ -36,11 +40,68 @@ class HackerOneScraper(BaseScraper):
     
     def __init__(self, data_dir: Path):
         super().__init__(data_dir)
+        self._email = (os.environ.get("HACKERONE_EMAIL") or "").strip()
+        self._password = (os.environ.get("HACKERONE_PASSWORD") or "").strip()
+        self._logged_in = False
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+    
+    def _ensure_authenticated(self) -> bool:
+        """Log in with HACKERONE_EMAIL and HACKERONE_PASSWORD if set. Returns True if session is usable."""
+        if self._logged_in:
+            return True
+        if not self._email or not self._password:
+            return False
+        client = self._get_client()
+        try:
+            # GET login page for CSRF token
+            self._rate_limit()
+            r = client.get(
+                self.SIGN_IN_URL,
+                headers={"User-Agent": self.headers["User-Agent"], "Accept": "text/html"},
+            )
+            if r.status_code != 200:
+                console.print("[dim]HackerOne: could not load login page[/dim]")
+                return False
+            soup = BeautifulSoup(r.text, "html.parser")
+            token_input = soup.find("input", {"name": re.compile(r"authenticity_token|csrf", re.I)})
+            if not token_input:
+                token_input = soup.find("input", {"type": "hidden"})  # often the first hidden is CSRF
+            token = token_input.get("value") if token_input else ""
+            if not token:
+                console.print("[dim]HackerOne: no CSRF token on login page[/dim]")
+                return False
+            # POST credentials
+            self._rate_limit()
+            login_data = {
+                "authenticity_token": token,
+                "user[email]": self._email,
+                "user[password]": self._password,
+            }
+            r2 = client.post(
+                self.SIGN_IN_URL,
+                headers={
+                    "User-Agent": self.headers["User-Agent"],
+                    "Accept": "text/html",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://hackerone.com",
+                    "Referer": self.SIGN_IN_URL,
+                },
+                data=login_data,
+            )
+            # Success: redirect away from sign_in or session cookie set
+            if r2.status_code in (200, 302):
+                if "sign_in" not in str(r2.url) or (r2.status_code == 302 and r2.headers.get("location") and "sign_in" not in r2.headers.get("location", "")):
+                    self._logged_in = True
+                    console.print("[green]HackerOne: logged in successfully[/green]")
+                    return True
+            console.print("[dim]HackerOne: login failed (check email/password in .env)[/dim]")
+        except Exception as e:
+            console.print(f"[dim]HackerOne login error: {e}[/dim]")
+        return False
     
     def _fetch_hacktivity_page(self, cursor: Optional[str] = None, size: int = 25) -> Optional[dict]:
         """Fetch a page of hacktivity reports using GraphQL API."""
@@ -264,6 +325,10 @@ class HackerOneScraper(BaseScraper):
         max_pages = (max_reports // 25) + 2
         
         console.print(f"[cyan]Scraping HackerOne hacktivity (target: {max_reports} reports)...[/cyan]")
+        if self._email and self._password:
+            self._ensure_authenticated()
+        else:
+            console.print("[dim]No HACKERONE_EMAIL/HACKERONE_PASSWORD in .env; scraping unauthenticated[/dim]")
         
         while len(reports) < max_reports and pages_fetched < max_pages:
             data = self._fetch_hacktivity_page(cursor=cursor, size=25)
